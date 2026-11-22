@@ -50,11 +50,17 @@ class Storage:
     def __init__(self, root):
         self.root = private_dir(Path(root))
         self.files = private_dir(self.root / "files")
+        self.partials = private_dir(self.root / "partials")
         self.db = self.root / "accounts.sqlite3"
         with closing(self.connection()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
             db.execute("""CREATE TABLE IF NOT EXISTS accounts (
-                username TEXT PRIMARY KEY, salt BLOB NOT NULL, digest BLOB NOT NULL
+                username TEXT PRIMARY KEY, salt BLOB NOT NULL, digest BLOB NOT NULL,
+                vip INTEGER NOT NULL DEFAULT 0
             )""")
+            columns = {column[1] for column in db.execute("PRAGMA table_info(accounts)")}
+            if "vip" not in columns:
+                db.execute("ALTER TABLE accounts ADD COLUMN vip INTEGER NOT NULL DEFAULT 0")
         self.db.chmod(0o600)
 
     def connection(self):
@@ -62,15 +68,15 @@ class Storage:
             raise ValueError("the account database must not be a symbolic link")
         return sqlite3.connect(self.db, timeout=5)
 
-    def add_user(self, username, password):
+    def add_user(self, username, password, vip=False):
         if not valid_user(username):
             raise ValueError("username must start with a lowercase letter and have 3–24 letters, digits or underscores")
         if not valid_password(password) or len(password) < 12:
             raise ValueError("password must have 12–128 printable ASCII characters")
         salt = os.urandom(16)
         with closing(self.connection()) as db, db:
-            db.execute("INSERT INTO accounts VALUES (?, ?, ?)",
-                       (username, salt, password_digest(password, salt)))
+            db.execute("INSERT INTO accounts (username, salt, digest, vip) VALUES (?, ?, ?, ?)",
+                       (username, salt, password_digest(password, salt), int(vip)))
             self.user_dir(username)
 
     def authenticate(self, username, password):
@@ -83,6 +89,13 @@ class Storage:
         salt, expected = account if account else (DUMMY_SALT, DUMMY_DIGEST)
         matches = hmac.compare_digest(password_digest(password, salt), expected)
         return account is not None and matches
+
+    def tier(self, username):
+        if not valid_user(username):
+            return None
+        with closing(self.connection()) as db:
+            result = db.execute("SELECT vip FROM accounts WHERE username = ?", (username,)).fetchone()
+        return bool(result[0]) if result else None
 
     def user_dir(self, username):
         if not valid_user(username):

@@ -1,10 +1,13 @@
 """Open one TLS session and run file commands until you quit."""
 import argparse
+import fcntl
 import getpass
+import hashlib
 import os
 import shlex
 import socket
 import ssl
+import stat
 import sys
 import tempfile
 import threading
@@ -12,8 +15,9 @@ from contextlib import contextmanager, suppress
 from pathlib import Path
 
 from protocol import (
-    IO_TIMEOUT, Kind, ProtocolError, deadline, enable_keepalive, measure,
-    recv_frame, send_frame, stream_receive, stream_send, valid_digest,
+    IO_TIMEOUT, MAX_FILE, TRANSFER_TIMEOUT, Kind, ProtocolError, deadline,
+    enable_keepalive, measure, prefix_digest, recv_frame, send_frame,
+    stream_receive, stream_send, valid_digest,
 )
 
 HEARTBEAT_INTERVAL = 15
@@ -24,9 +28,15 @@ class RequestError(Exception):
 
 
 class Client:
-    def __init__(self, host, port, ca, *, heartbeat=HEARTBEAT_INTERVAL):
+    def __init__(self, host, port, ca, *, heartbeat=HEARTBEAT_INTERVAL, certificate=None, key=None):
         tls = ssl.create_default_context(cafile=str(ca))
         tls.minimum_version = ssl.TLSVersion.TLSv1_2
+        if (certificate is None) != (key is None):
+            raise ValueError("both client certificate and key are required")
+        if certificate is not None:
+            tls.load_cert_chain(str(certificate), str(key))
+        self.certificate = certificate
+        self.last_resume_offset = 0
         raw = socket.create_connection((host, port), timeout=IO_TIMEOUT)
         try:
             enable_keepalive(raw)
@@ -104,41 +114,92 @@ class Client:
             finally:
                 self.lock.release()
 
-    def put(self, local, name):
+    def login(self, username, password=None):
+        metadata = {"username": username}
+        if self.certificate is None:
+            metadata["password"] = password
+        return self.command(Kind.LOGIN, metadata)
+
+    def put(self, local, name, *, resume=False):
         with local.open("rb") as file:
             size, digest = measure(file)
             with self.exchange():
-                request_id = self.request(Kind.PUT, {"name": name, "size": size, "sha256": digest})
-                self.receive(request_id, Kind.READY)
-                end = deadline()
-                send_frame(self.sock, Kind.DATA, request_id, body_len=size, end=end)
-                stream_send(self.sock, file, size, end)
+                metadata = {"name": name, "size": size, "sha256": digest}
+                if resume:
+                    metadata["resume"] = True
+                request_id = self.request(Kind.PUT, metadata)
+                ready, _ = self.receive(request_id, Kind.READY)
+                offset = ready.get("offset", 0) if resume else 0
+                if type(offset) is not int or not 0 <= offset <= size:
+                    raise ProtocolError("invalid upload offset")
+                self.last_resume_offset = offset
+                file.seek(offset)
+                end = deadline(TRANSFER_TIMEOUT)
+                send_frame(self.sock, Kind.DATA, request_id, body_len=size - offset, end=end)
+                stream_send(self.sock, file, size - offset, end)
                 reply, _ = self.receive(request_id, Kind.OK, end=end)
                 if reply.get("sha256") != digest:
                     raise ProtocolError("server reported an unexpected digest")
         return digest
 
-    def get(self, name, local):
-        # Create the local temporary file before requesting any remote payload.
+    def get(self, name, local, *, resume=False):
+        if resume:
+            key = hashlib.sha256(os.fsencode(local.name)).hexdigest()
+            partial = local.parent / (".download-" + key + ".part")
+            flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+            with os.fdopen(os.open(partial, flags, 0o600), "r+b") as file:
+                if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+                    raise ValueError("local partial file must be an ordinary file")
+                try:
+                    fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise ValueError("destination already has a resumable download running") from error
+                digest = self.receive_download(name, file, True)
+                file.flush()
+                os.replace(partial, local)
+                return digest
+
         with tempfile.NamedTemporaryFile(dir=local.parent, prefix=".download-", delete=False) as file:
             temporary = Path(file.name)
             try:
-                with self.exchange():
-                    request_id = self.request(Kind.GET, {"name": name})
-                    end = deadline()
-                    metadata, size = self.receive(request_id, Kind.DATA, end=end)
-                    expected = metadata.get("sha256")
-                    if type(metadata.get("size")) is not int or metadata["size"] != size or not valid_digest(expected):
-                        raise ProtocolError("invalid download metadata")
-                    actual = stream_receive(self.sock, file, size, end)
-                if actual != expected:
-                    raise RequestError("local SHA-256 verification failed")
-                file.close()
+                digest = self.receive_download(name, file, False)
+                file.flush()
                 os.replace(temporary, local)
-                return actual
+                return digest
             finally:
                 with suppress(FileNotFoundError):
                     temporary.unlink()
+
+    def receive_download(self, name, file, resume):
+        with self.exchange():
+            request = {"name": name}
+            available = file.seek(0, os.SEEK_END) if resume else 0
+            if available > MAX_FILE:
+                available = 0
+            digest = prefix_digest(file, available)
+            if resume:
+                request.update(offset=available, prefix_sha256=digest.hexdigest())
+            request_id = self.request(Kind.GET, request)
+            end = deadline(TRANSFER_TIMEOUT)
+            metadata, body_size = self.receive(request_id, Kind.DATA, end=end)
+            size, expected = metadata.get("size"), metadata.get("sha256")
+            offset = metadata.get("offset", 0)
+            if (type(size) is not int or not 0 <= size <= MAX_FILE
+                    or type(offset) is not int or offset not in (0, available)
+                    or offset + body_size != size or not valid_digest(expected)):
+                raise ProtocolError("invalid download metadata")
+            self.last_resume_offset = offset
+            if offset == 0:
+                file.seek(0)
+                file.truncate()
+                digest = hashlib.sha256()
+            else:
+                file.seek(offset)
+            actual = stream_receive(self.sock, file, body_size, end, digest)
+        if actual != expected:
+            file.truncate(0)
+            raise RequestError("local SHA-256 verification failed")
+        return actual
 
 
 def execute(client, line):
@@ -147,20 +208,26 @@ def execute(client, line):
         return True
     command, *args = words
     if command == "help" and not args:
-        print("list | put LOCAL [REMOTE] | get REMOTE [LOCAL] | ping | status | quit")
+        print("list | put/rput LOCAL [REMOTE] | get/rget REMOTE [LOCAL] | ping | status | quit")
     elif command == "list" and not args:
         entries = client.command(Kind.LIST)["files"]
         for entry in entries:
             print(f"{entry['name']}\t{entry['size']} bytes")
         print(f"{len(entries)} file(s)")
-    elif command == "put" and 1 <= len(args) <= 2:
+    elif command in ("put", "rput") and 1 <= len(args) <= 2:
         source = Path(args[0])
         name = args[1] if len(args) == 2 else source.name
-        print(f"Uploaded {name}  SHA-256 {client.put(source, name)}")
-    elif command == "get" and 1 <= len(args) <= 2:
+        digest = client.put(source, name, resume=command == "rput")
+        print(f"Uploaded {name}  SHA-256 {digest}")
+        if command == "rput":
+            print(f"Resumed at byte {client.last_resume_offset}")
+    elif command in ("get", "rget") and 1 <= len(args) <= 2:
         name = args[0]
         destination = Path(args[1] if len(args) == 2 else Path(name).name)
-        print(f"Downloaded {destination}  SHA-256 {client.get(name, destination)}")
+        digest = client.get(name, destination, resume=command == "rget")
+        print(f"Downloaded {destination}  SHA-256 {digest}")
+        if command == "rget":
+            print(f"Resumed at byte {client.last_resume_offset}")
     elif command == "ping" and not args:
         print(client.command(Kind.PING)["message"])
     elif command == "status" and not args:
@@ -181,14 +248,20 @@ def main():
     parser.add_argument("--port", type=int, default=18081)
     parser.add_argument("--ca", type=Path, default=Path("runtime/tls/ca.pem"))
     parser.add_argument("--user", required=True)
+    parser.add_argument("--cert", type=Path)
+    parser.add_argument("--key", type=Path)
     parser.add_argument("--password-stdin", action="store_true", help="read the password from the first stdin line")
     parser.add_argument("--batch", action="store_true", help="read commands until stdin EOF")
     options = parser.parse_args()
-    password = (sys.stdin.readline().rstrip("\r\n") if options.password_stdin
-                else getpass.getpass("Password: "))
+    if bool(options.cert) != bool(options.key):
+        parser.error("--cert and --key must be used together")
+    password = None
+    if options.cert is None:
+        password = (sys.stdin.readline().rstrip("\r\n") if options.password_stdin
+                    else getpass.getpass("Password: "))
     try:
-        with Client(options.host, options.port, options.ca) as client:
-            client.command(Kind.LOGIN, {"username": options.user, "password": password})
+        with Client(options.host, options.port, options.ca, certificate=options.cert, key=options.key) as client:
+            client.login(options.user, password)
             print(f"Logged in as {options.user} ({client.tls_version}). Type help for commands.", flush=True)
             while True:
                 try:

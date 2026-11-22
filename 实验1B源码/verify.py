@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from client import Client, RequestError
@@ -132,6 +133,28 @@ def verify(directory, port, ca):
         alice.command(Kind.QUIT)
 
 
+@contextmanager
+def running_server(runtime, *server_args):
+    with subprocess.Popen(
+        [sys.executable, "-u", str(SOURCE / "server.py"), "--runtime", str(runtime), "--port", "0", *server_args],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    ) as server:
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(server.stdout, selectors.EVENT_READ)
+                if not selector.select(timeout=10):
+                    raise RuntimeError("server startup timed out")
+            first = server.stdout.readline().strip()
+            if not first.startswith("Listening on 127.0.0.1:"):
+                raise RuntimeError(first + "\n" + server.stdout.read())
+            print(first)
+            port = int(first.split()[2].split(":")[1])
+            yield port
+        finally:
+            if server.poll() is None:
+                server.terminate()
+            server.communicate(timeout=5)
+
 def main():
     with tempfile.TemporaryDirectory(prefix="lab1b-test-") as temporary:
         directory = Path(temporary)
@@ -142,25 +165,8 @@ def main():
             print(run_tool("setup.py", "--runtime", runtime, "add-user", username,
                            "--password-stdin", typed=PASSWORD + "\n"))
         ca = runtime / "tls" / "ca.pem"
-        with subprocess.Popen(
-            [sys.executable, "-u", str(SOURCE / "server.py"), "--runtime", str(runtime), "--port", "0"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        ) as server:
-            try:
-                with selectors.DefaultSelector() as selector:
-                    selector.register(server.stdout, selectors.EVENT_READ)
-                    if not selector.select(timeout=10):
-                        raise RuntimeError("server startup timed out")
-                first = server.stdout.readline().strip()
-                if not first.startswith("Listening on 127.0.0.1:"):
-                    raise RuntimeError(first + "\n" + server.stdout.read())
-                print(first)
-                port = int(first.split()[2].split(":")[1])
-                verify(directory, port, ca)
-            finally:
-                if server.poll() is None:
-                    server.terminate()
-                server.communicate(timeout=5)
+        with running_server(runtime) as port:
+            verify(directory, port, ca)
     print("All checks passed.")
 
 

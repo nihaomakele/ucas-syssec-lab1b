@@ -15,6 +15,7 @@ MAX_FILE = 32 * 1024 * 1024
 CHUNK_SIZE = 64 * 1024
 IO_TIMEOUT = 15
 FRAME_TIMEOUT = 90
+TRANSFER_TIMEOUT = 180
 
 
 class Kind(IntEnum):
@@ -43,8 +44,8 @@ def _reject_duplicate_keys(items):
     return result
 
 
-def deadline():
-    return time.monotonic() + FRAME_TIMEOUT
+def deadline(seconds=FRAME_TIMEOUT):
+    return time.monotonic() + seconds
 
 
 def _set_timeout(sock, end, limit=IO_TIMEOUT):
@@ -102,20 +103,26 @@ def send_frame(sock, kind, request_id, metadata=None, body_len=0, end=None):
     sock.sendall(HEADER.pack(MAGIC, VERSION, kind, 0, request_id, len(raw_meta), body_len) + raw_meta)
 
 
-def stream_send(sock, source, size, end):
+def stream_send(sock, source, size, end, throttle=None):
     while size:
         block = source.read(min(CHUNK_SIZE, size))
         if not block:
             raise ProtocolError("source became shorter during transfer")
+        if throttle:
+            throttle(len(block), end)
         _set_timeout(sock, end)
         sock.sendall(block)
         size -= len(block)
 
 
-def stream_receive(sock, destination, size, end):
-    digest = hashlib.sha256()
+def stream_receive(sock, destination, size, end, digest=None, throttle=None):
+    if digest is None:
+        digest = hashlib.sha256()
     while size:
-        block = _read_exact(sock, min(CHUNK_SIZE, size), end)
+        amount = min(CHUNK_SIZE, size)
+        if throttle:
+            throttle(amount, end)
+        block = _read_exact(sock, amount, end)
         destination.write(block)
         digest.update(block)
         size -= len(block)
@@ -135,6 +142,19 @@ def measure(source):
         digest.update(block)
     source.seek(0)
     return size, digest.hexdigest()
+
+
+def prefix_digest(file, length):
+    """Hash the first length bytes and leave the stream at that offset."""
+    file.seek(0)
+    digest = hashlib.sha256()
+    while length:
+        data = file.read(min(CHUNK_SIZE, length))
+        if not data:
+            raise ValueError("file changed while reading its prefix")
+        digest.update(data)
+        length -= len(data)
+    return digest
 
 
 def valid_digest(value):

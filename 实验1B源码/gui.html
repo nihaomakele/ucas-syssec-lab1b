@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>安全文件传输</title>
+<link rel="stylesheet" href="/gui.css">
+<script src="/gui.js" defer></script>
+<main>
+  <header><h1>安全文件传输</h1><p id="connection-state" role="status">未连接</p></header>
+  <form id="connection">
+    <div class="fields">
+      <label>主机<input name="host" value="127.0.0.1" required></label>
+      <label>端口<input name="port" type="number" value="18081" min="1" max="65535" required></label>
+      <label>账号<input name="username" autocomplete="username" required></label>
+      <label>密码<input name="password" type="password" autocomplete="off"></label>
+    </div>
+    <details>
+      <summary>证书设置</summary>
+      <div class="fields certificates">
+        <label>服务端 CA 路径<input name="ca" value="runtime/tls/ca.pem" required></label>
+        <label>客户端证书路径<input name="cert" placeholder="runtime/client-certs/alice/client.pem"></label>
+        <label>客户端私钥路径<input name="key" placeholder="runtime/client-certs/alice/client-key.pem"></label>
+      </div>
+    </details>
+    <div class="actions"><button type="submit">连接</button><button type="button" id="disconnect" disabled>断开</button></div>
+  </form>
+  <section class="panel" aria-labelledby="files-title">
+    <div class="panel-head"><h2 id="files-title">服务器文件</h2>
+      <div class="actions">
+        <button id="refresh" disabled>刷新</button>
+        <button id="upload" disabled>上传文件</button>
+        <button id="download" disabled>下载选中</button>
+      </div>
+    </div>
+    <input type="file" id="picker" multiple hidden>
+    <table><thead><tr><th scope="col">选择</th><th scope="col">文件名</th><th scope="col">字节数</th></tr></thead>
+      <tbody id="files"></tbody>
+    </table>
+    <p id="empty">连接后在此显示文件。</p>
+  </section>
+  <section class="panel" aria-labelledby="jobs-title">
+    <h2 id="jobs-title">传输记录</h2>
+    <ul id="jobs" aria-live="polite"></ul>
+  </section>
+</main>
+</html>
